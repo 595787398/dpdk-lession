@@ -9,16 +9,14 @@ int g_port_id = 0;
 
 uint32 g_local_src_ip = IP_STR_COVER_UINT(192, 168, 1, 2);
 
-int local_eth_macaddr_get_by_port_id(int port_id, )
+char* mac2string_print(uint8_t *mac)
 {
-	struct rte_eth_dev *eth_dev;
+	static char buf[sizeof("HH:HH:HH:HH:HH:HH")];
 
-	RTE_ETH_VALID_PORTID_OR_RET(port_id);
-	eth_dev = rte_eth_devices[port_id];
+	snprintf(buf, sizeof(buf) -1 ,"%02x:%02x:%02x:%02x:%02x:%02x",
+		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-	//rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr * mac_addr)
-	//rte_ether_addr_copy(eth_dev->data->mac_addrs[0], struct rte_ether_addr * ea_to)
-
+	return buf;
 }
 
 /* src-mac | dst-mac | frame-type*/
@@ -38,13 +36,10 @@ int eth_packet_encap(uint8 *packet, uint8 *src_mac, uint8 *dst_mac, uint16_t eth
 /*
 	|arp
 */
-int arp_request_packet_encap(uint8 *packet, uint8_t *src_mac, uint8_t *dst_mac,
+int arp_packet_encap(uint8 *packet, uint8_t *src_mac, uint8_t *dst_mac,
 	uint32_t src_ip, uint32_t dst_ip, uint16_t opcode)
 {
-	int packet_len;
-
 	struct rte_arp_hdr *arp_packet = packet;
-	packet_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
 
 	arp_packet->arp_hardware = htons(1);
 	arp_packet->arp_protocol = htons(RTE_ETHER_TYPE_IPV4);
@@ -58,6 +53,28 @@ int arp_request_packet_encap(uint8 *packet, uint8_t *src_mac, uint8_t *dst_mac,
 	arp_packet->arp_data.arp_tip = dst_ip;
 
 	return 0;
+}
+
+struct rte_mbuf * arp_reply_packet_encap(struct rte_mempool *mp, int port_id,
+	struct rte_ether_addr *dst_mac, uint32_t src_ip, uint32_t dst_ip)
+{
+	int packet_len;
+	struct rte_ether_addr src_mac;
+
+	struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mp);
+	if (!mbuf) {
+		rte_exit(-1, "arp replcy packet malloc failed");
+	}
+
+	struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+	rte_eth_macaddr_get(port_id, &src_mac);
+	eth_packet_encap(eth_hdr, &src_mac, dst_mac, RTE_ETHER_TYPE_ARP);
+
+	/* arp */
+	struct rte_arp_hdr *arp_hdr = rte_pktmbuf_mtod_offset(mbuf, struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+	arp_packet_encap(arp_hdr, &src_mac, dst_mac, src_ip, dst_ip, RTE_ARP_OP_REPLY);
+
+	return mbuf;
 }
 
 /* arp请求 */
@@ -135,6 +152,19 @@ static dpdk_eth_dev_init(struct rte_mempool * mp)
 
 }
 
+int arp_packet_parse(struct rte_mbuf *rx_packet, struct rte_ether_addr *src_mac,
+		struct rte_ether_addr *dst_mac, uint32_t *src_ip ,uint32_t *dst_ip)
+{
+	struct rte_arp_hdr *arp_hdr = rte_pktmbuf_mtod_offset(rx_packet, sizeof(struct rte_ether_addr));
+
+	rte_memcpy(src_mac, &arp_hdr->arp_data.arp_sha, sizeof(struct rte_ether_addr));
+	rte_memcpy(dst_mac, &arp_hdr->arp_data.arp_tha, sizeof(struct rte_ether_addr));
+	*src_ip = arp_hdr->arp_data.arp_sip;
+	*dst_ip = arp_hdr->arp_data.arp_tip;
+
+	return 0;
+}
+
 #define BRUST_SIZE 32
 int main(int argc, char **argv)
 {
@@ -144,6 +174,9 @@ int main(int argc, char **argv)
 	struct rte_mbuf *rx_pkts[BRUST_SIZE];
 	struct rte_ether_hdr *ether_hdr;
 	struct rte_mbuf *tx_pkts[BRUST_SIZE];
+	struct rte_ether_addr src_mac;
+	struct rte_ether_addr dst_mac;
+	uint32_t src_ip, dst_ip;
 
 	if (rte_eal_init(argc, argv) < 0) {
 		rte_exit(-1, "eal init failed");
@@ -176,17 +209,36 @@ int main(int argc, char **argv)
 			ether_hdr = rte_pktmbuf_mtod(rx_pkts[i], struct rte_ether_hdr *);
 			//if (ether_hdr->ether_type)
 			printf("ether type:%d\n", ether_hdr->ether_type);
+
+			if (ether_hdr->ether_type == RTE_ETHER_TYPE_ARP) {
+				arp_packet_parse(rx_pkts[i], &src_mac, &dst_mac, &src_ip, &dst_ip);
+				printf("arp packet:[%s:%s]--->", mac2string_print(src_mac.addr_bytes), inet_ntoa(src_ip));
+				printf("arp packet:[%s:%s]", mac2string_print(dst_mac.addr_bytes), inet_ntoa(dst_ip));
+				struct rte_arp_hdr *arp_hdr = rte_pktmbuf_mtod_offset(rx_pkts[i], sizeof(struct rte_ether_addr));
+
+				if (arp_hdr->arp_opcode == RTE_ARP_OP_REQUEST) {
+					/* 接收arp请求报文，并发送响应报文 */
+
+					struct rte_mbuf * tx_packet = arp_reply_packet_encap(mempool, g_port_id,
+						dst_mac, src_ip, dst_ip);
+
+					rte_eth_tx_burst(g_port_id, 0, &tx_packet, 1);
+
+				} else if (arp_hdr->arp_opcode == RTE_ARP_OP_REPLY) {
+					/* 接收arp响应报文 */
+
+				}
+			}
+
+			rte_pktmbuf_free(rx_pkts[i]);
+
 		}
-
-		/*  */
-
-		rte_eth_tx_burst(g_port_id, 0, tx_pkts, BRUST_SIZE);
 
 		/* 执行定时器 */
 		uint64_t prve_tsc = 0;
 		uint64_t curr_tsc = rte_rdtsc();
 		if ((curr_tsc - prve_tsc) > TIMER_RESOLUTION_CYCLES) {
-			rte_timer_manage();
+			//rte_timer_manage();
 		}
 	}
 
